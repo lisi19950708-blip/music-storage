@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GitHub Music Player — 自动从仓库生成音乐列表</title>
+  <style>
+    /* 轻量美观样式 */
+    :root{--bg:#0f1724;--card:#0b1220;--muted:#9aa4b2;--accent:#7c3aed}
+    html,body{height:100%;margin:0;font-family:Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;color:#e6eef8;background:linear-gradient(180deg,#071124 0%, #081524 100%);}
+    .wrap{max-width:980px;margin:28px auto;padding:20px}
+    header{display:flex;gap:12px;align-items:center}
+    h1{margin:0;font-size:20px}
+    p.lead{margin:4px 0 18px;color:var(--muted)}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+    input[type=text]{padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);background:rgba(255,255,255,0.02);color:inherit;min-width:220px}
+    button{padding:10px 12px;border-radius:10px;border:0;background:var(--accent);color:white;cursor:pointer}
+    .grid{display:grid;grid-template-columns:1fr 320px;gap:18px}
+    .list{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));padding:12px;border-radius:12px;min-height:360px}
+    .item{display:flex;align-items:center;gap:12px;padding:8px;border-radius:8px;cursor:pointer}
+    .item:hover{background:rgba(255,255,255,0.02)}
+    .item.active{outline:2px solid rgba(124,58,237,0.18)}
+    .meta{flex:1}
+    .title{font-weight:600}
+    .sub{font-size:13px;color:var(--muted)}
+    .player{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));padding:16px;border-radius:12px}
+    .cover{width:100%;height:220px;border-radius:8px;background:linear-gradient(135deg,#0b1220,#122031);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:14px}
+    .playlist-actions{display:flex;gap:8px;margin-top:12px}
+    .small{font-size:13px;color:var(--muted)}
+    a.link{color:var(--accent);text-decoration:none}
+    footer{margin-top:18px;color:var(--muted);font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>GitHub Music Player</h1>
+        <p class="lead">自动从指定 GitHub 仓库读取音频文件并通过 jsDelivr 提供 CDN 播放（无需后端）。</p>
+      </div>
+    </header>
+
+    <div class="controls">
+      <input id="ownerRepo" type="text" value="lisi19950708-blip/music-storage" placeholder="owner/repo（例如：user/repo）" />
+      <input id="branch" type="text" value="main" placeholder="branch（例如：main）" />
+      <button id="loadBtn">加载音乐列表</button>
+      <input id="search" type="text" placeholder="搜索文件名..." />
+      <button id="clearCache">清缓存</button>
+    </div>
+
+    <div class="grid">
+      <div class="list" id="list">
+        <div id="listInner">请点击 “加载音乐列表” 开始 — 默认仓库：<strong>lisi19950708-blip/music-storage</strong></div>
+      </div>
+
+      <aside class="player">
+        <div class="cover" id="cover">未选择曲目</div>
+        <div style="margin-top:12px">
+          <audio id="audio" controls style="width:100%"></audio>
+        </div>
+        <div class="playlist-actions">
+          <button id="prev">上一个</button>
+          <button id="next">下一个</button>
+          <button id="shuffle">随机</button>
+        </div>
+        <div style="margin-top:12px">
+          <div class="small">当前：<span id="currentTitle">—</span></div>
+          <div class="small">源（jsDelivr）：<a id="cdnLink" class="link" target="_blank" rel="noopener">—</a></div>
+        </div>
+      </aside>
+    </div>
+
+    <footer>
+      使用说明：将本文件放到仓库根目录并启用 GitHub Pages（branch: main）。播放链接使用 jsDelivr。<br>
+      注：GitHub API 有匿名速率限制，频繁刷新可能被限制。
+    </footer>
+  </div>
+
+<script>
+  // === 配置与工具函数 ===
+  const listEl = document.getElementById('listInner');
+  const ownerRepoEl = document.getElementById('ownerRepo');
+  const branchEl = document.getElementById('branch');
+  const loadBtn = document.getElementById('loadBtn');
+  const searchEl = document.getElementById('search');
+  const clearCacheBtn = document.getElementById('clearCache');
+
+  const audio = document.getElementById('audio');
+  const cover = document.getElementById('cover');
+  const currentTitle = document.getElementById('currentTitle');
+  const cdnLink = document.getElementById('cdnLink');
+
+  let tracks = [];
+  let currentIndex = -1;
+  let shuffleMode = false;
+
+  function jsDelivrUrl(owner, repo, branch, path){
+    // encode path segments correctly
+    // Use @branch to avoid stale caching when you update tags/branch.
+    const encoded = path.split('/').map(encodeURIComponent).join('/');
+    return `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${branch}/${encoded}`;
+  }
+
+  function formatName(path){
+    const p = path.split('/').pop();
+    try{ return decodeURIComponent(p); }catch(e){ return p; }
+  }
+
+  function isAudioFile(path){
+    return /\.(mp3|wav|flac|m4a|ogg|aac)$/i.test(path);
+  }
+
+  // cache results in sessionStorage to avoid API rate limits
+  function cacheKey(owner, repo, branch){ return `gh_music_${owner}_${repo}_${branch}`; }
+
+  async function fetchRepoTree(owner, repo, branch){
+    // Use GitHub REST API: GET /repos/{owner}/{repo}/git/trees/{branch}?recursive=1
+    const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
+    const r = await fetch(url);
+    if(r.status===404) throw new Error('仓库或分支不存在（404）');
+    if(r.status===403) {
+      throw new Error('访问被拒绝（可能是 API 限制）。');
+    }
+    const data = await r.json();
+    if(!data.tree) throw new Error('无法读取仓库树');
+    return data.tree.map(i=>i.path);
+  }
+
+  function renderList(filtered){
+    if(filtered.length===0){ listEl.innerHTML = '<div class="small">未找到音频文件。</div>'; return; }
+    const frag = document.createDocumentFragment();
+    filtered.forEach((path, i)=>{
+      const item = document.createElement('div');
+      item.className = 'item';
+      item.dataset.index = i;
+      const meta = document.createElement('div'); meta.className = 'meta';
+      const title = document.createElement('div'); title.className = 'title'; title.textContent = formatName(path);
+      const sub = document.createElement('div'); sub.className = 'sub'; sub.textContent = path;
+      meta.appendChild(title); meta.appendChild(sub);
+      item.appendChild(meta);
+      item.addEventListener('click', ()=>{ playByIndex(i); highlight(i); });
+      frag.appendChild(item);
+    });
+    listEl.innerHTML = '';
+    listEl.appendChild(frag);
+  }
+
+  function highlight(i){
+    const items = listEl.querySelectorAll('.item');
+    items.forEach(it=>it.classList.remove('active'));
+    const el = listEl.querySelector(`.item[data-index="${i}"]`);
+    if(el) el.classList.add('active');
+  }
+
+  function playByIndex(i){
+    if(i<0 || i>=tracks.length) return;
+    currentIndex = i;
+    const t = tracks[i];
+    audio.src = t.cdn;
+    audio.play().catch(()=>{});
+    cover.textContent = t.name;
+    currentTitle.textContent = t.name;
+    cdnLink.href = t.cdn; cdnLink.textContent = '打开播放源';
+    highlight(i);
+  }
+
+  document.getElementById('prev').addEventListener('click', ()=>{
+    if(tracks.length===0) return;
+    if(shuffleMode) return playByIndex(Math.floor(Math.random()*tracks.length));
+    let i = currentIndex-1; if(i<0) i = tracks.length-1; playByIndex(i);
+  });
+  document.getElementById('next').addEventListener('click', ()=>{
+    if(tracks.length===0) return;
+    if(shuffleMode) return playByIndex(Math.floor(Math.random()*tracks.length));
+    let i = currentIndex+1; if(i>=tracks.length) i = 0; playByIndex(i);
+  });
+  document.getElementById('shuffle').addEventListener('click', ()=>{ shuffleMode = !shuffleMode; document.getElementById('shuffle').textContent = shuffleMode? '随机 (开)' : '随机'; });
+
+  audio.addEventListener('ended', ()=>{ document.getElementById('next').click(); });
+
+  loadBtn.addEventListener('click', async ()=>{
+    const [owner, repo] = ownerRepoEl.value.trim().split('/');
+    const branch = branchEl.value.trim() || 'main';
+    if(!owner||!repo){ alert('请输入 owner/repo'); return; }
+    const key = cacheKey(owner, repo, branch);
+    const cached = sessionStorage.getItem(key);
+    try{
+      let paths = null;
+      if(cached){
+        paths = JSON.parse(cached);
+      } else {
+        listEl.innerHTML = '<div class="small">正在从 GitHub 加载仓库结构，请稍候...</div>';
+        const tree = await fetchRepoTree(owner, repo, branch);
+        paths = tree.filter(isAudioFile);
+        sessionStorage.setItem(key, JSON.stringify(paths));
+      }
+      // build tracks with jsDelivr links
+      tracks = paths.map(p=>({ path:p, name:formatName(p), cdn: jsDelivrUrl(owner, repo, branch, p) }));
+      renderList(paths);
+      if(tracks.length>0) playByIndex(0);
+    }catch(err){
+      listEl.innerHTML = '<div class="small">加载失败：'+(err.message||err)+'</div>';
+    }
+  });
+
+  searchEl.addEventListener('input', ()=>{
+    const q = searchEl.value.trim().toLowerCase();
+    const filtered = (tracks.map(t=>t.path)).filter(p=>p.toLowerCase().includes(q));
+    renderList(filtered);
+  });
+
+  clearCacheBtn.addEventListener('click', ()=>{
+    const [owner,repo] = ownerRepoEl.value.trim().split('/');
+    const br = branchEl.value.trim()||'main';
+    if(!owner||!repo) return alert('请输入 owner/repo');
+    sessionStorage.removeItem(cacheKey(owner,repo,br));
+    alert('已清除缓存，请重新加载列表');
+  });
+
+  // 自动加载默认仓库 on load
+  window.addEventListener('load', ()=>{ loadBtn.click(); });
+</script>
+</body>
+</html>
